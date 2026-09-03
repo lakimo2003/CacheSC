@@ -1,10 +1,16 @@
+#ifndef _GNU_SOURCE
+    #define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/stat.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <cachesc.h>
@@ -13,8 +19,17 @@
 
 #define NUMBER_OF_SETS 3
 
-#define GO_FIFO   "/tmp/cachesc_go_fifo"
-#define DONE_FIFO "/tmp/cachesc_done_fifo"
+#define IPC_SHM_NAME "/cachesc_l2_ipc"
+
+typedef struct {
+    pthread_mutex_t mutex;
+    sem_t ready_sem;
+    sem_t go_sem;
+    sem_t done_sem;
+    char command;
+    int stop;
+    int initialized;
+} ipc_state;
 
 static uint32_t monitored_sets[NUMBER_OF_SETS] = {
     30,
@@ -22,71 +37,151 @@ static uint32_t monitored_sets[NUMBER_OF_SETS] = {
     99
 };
 
-static void send_byte(int fd, char value)
+static void die_pthread(const char *operation, int error)
 {
-    ssize_t result;
+    errno = error;
+    perror(operation);
+    exit(EXIT_FAILURE);
+}
+
+static void sem_wait_checked(sem_t *sem, const char *operation)
+{
+    int result;
 
     do {
-        result = write(fd, &value, 1);
+        result = sem_wait(sem);
     } while (result < 0 && errno == EINTR);
 
-    if (result != 1) {
-        perror("write");
+    if (result != 0) {
+        perror(operation);
         exit(EXIT_FAILURE);
     }
 }
 
-static char receive_byte(int fd)
+static ipc_state *create_ipc(void)
 {
-    char value;
-    ssize_t result;
+    pthread_mutexattr_t mutex_attr;
+    ipc_state *ipc;
+    int fd;
+    int result;
 
-    do {
-        result = read(fd, &value, 1);
-    } while (result < 0 && errno == EINTR);
+    shm_unlink(IPC_SHM_NAME);
 
-    if (result != 1) {
-        fprintf(stderr, "Failed to receive victim response\n");
+    fd = shm_open(IPC_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        perror("shm_open");
         exit(EXIT_FAILURE);
     }
 
-    return value;
+    if (ftruncate(fd, sizeof(*ipc)) != 0) {
+        perror("ftruncate");
+        close(fd);
+        shm_unlink(IPC_SHM_NAME);
+        exit(EXIT_FAILURE);
+    }
+
+    ipc = mmap(NULL, sizeof(*ipc), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (ipc == MAP_FAILED) {
+        perror("mmap");
+        shm_unlink(IPC_SHM_NAME);
+        exit(EXIT_FAILURE);
+    }
+
+    memset(ipc, 0, sizeof(*ipc));
+
+    result = pthread_mutexattr_init(&mutex_attr);
+    if (result != 0) {
+        die_pthread("pthread_mutexattr_init", result);
+    }
+
+    result = pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+    if (result != 0) {
+        die_pthread("pthread_mutexattr_setpshared", result);
+    }
+
+    result = pthread_mutex_init(&ipc->mutex, &mutex_attr);
+    if (result != 0) {
+        die_pthread("pthread_mutex_init", result);
+    }
+
+    result = pthread_mutexattr_destroy(&mutex_attr);
+    if (result != 0) {
+        die_pthread("pthread_mutexattr_destroy", result);
+    }
+
+    if (sem_init(&ipc->ready_sem, 1, 0) != 0 ||
+        sem_init(&ipc->go_sem, 1, 0) != 0 ||
+        sem_init(&ipc->done_sem, 1, 0) != 0) {
+        perror("sem_init");
+        munmap(ipc, sizeof(*ipc));
+        shm_unlink(IPC_SHM_NAME);
+        exit(EXIT_FAILURE);
+    }
+
+    ipc->initialized = 1;
+
+    return ipc;
 }
 
-/*
- * Perform one Prime+Probe round.
- *
- * command == 0:
- *     Victim wakes up but does not access its cache line.
- *
- * command == 1:
- *     Victim accesses its selected cache line.
- */
+static void destroy_ipc(ipc_state *ipc)
+{
+    if (!ipc) {
+        return;
+    }
+
+    sem_destroy(&ipc->done_sem);
+    sem_destroy(&ipc->go_sem);
+    sem_destroy(&ipc->ready_sem);
+    pthread_mutex_destroy(&ipc->mutex);
+    munmap(ipc, sizeof(*ipc));
+    shm_unlink(IPC_SHM_NAME);
+}
+
+static void send_command(ipc_state *ipc, char command)
+{
+    pthread_mutex_lock(&ipc->mutex);
+    ipc->command = command;
+    pthread_mutex_unlock(&ipc->mutex);
+
+    sem_post(&ipc->go_sem);
+}
+
+static void wait_for_victim(ipc_state *ipc)
+{
+    sem_wait_checked(&ipc->done_sem, "sem_wait done");
+}
+
+static void request_victim_stop(ipc_state *ipc)
+{
+    pthread_mutex_lock(&ipc->mutex);
+    ipc->stop = 1;
+    pthread_mutex_unlock(&ipc->mutex);
+
+    sem_post(&ipc->go_sem);
+}
+
+
+ // command == 0:
+ // Victim wakes up but does not access its cache line.
+ // command == 1:
+ // Victim accesses its selected cache line.
 static void measure_round(
     cacheline *attacker_sets,
-    int go_fd,
-    int done_fd,
+    ipc_state *ipc,
     char command,
     time_type *measurements)
 {
-    /*
-     * Fill all ways of sets 30, 60 and 99.
-     */
+
+    //Fill all ways of sets 30, 60 and 99
     cacheline *probe_head = prime_rev(attacker_sets);
 
-    /*
-     * Tell the victim what to do.
-     */
-    send_byte(go_fd, command);
+    send_command(ipc, command);
 
-    /*
-     * Wait until the victim has finished.
-     */
-    receive_byte(done_fd);
+    sem_wait(&ipc->done_sem);
 
-    /*
-     * Probe the same three sets.
-     */
+    //Probe the same three sets.
     probe(L2, probe_head);
 
     memset(
@@ -114,9 +209,6 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /*
-     * Use CPU7. CPU7 and CPU8 share the same L2.
-     */
     pin_to_cpu(ATTACKER_CPU);
 
     fprintf(
@@ -128,9 +220,6 @@ int main(int argc, char **argv)
 
     cache_ctx *ctx = get_cache_ctx(L2);
 
-    /*
-     * Create eviction sets only for sets 30, 60 and 99.
-     */
     cacheline *attacker_sets =
         prepare_cache_set_ds(
             ctx,
@@ -138,43 +227,12 @@ int main(int argc, char **argv)
             NUMBER_OF_SETS
         );
 
-    /*
-     * Create synchronization pipes.
-     *
-     * Remove leftovers from an earlier execution first.
-     */
-    unlink(GO_FIFO);
-    unlink(DONE_FIFO);
-
-    if (mkfifo(GO_FIFO, 0666) != 0) {
-        perror("mkfifo go");
-        return EXIT_FAILURE;
-    }
-
-    if (mkfifo(DONE_FIFO, 0666) != 0) {
-        perror("mkfifo done");
-        unlink(GO_FIFO);
-        return EXIT_FAILURE;
-    }
+    ipc_state *ipc = create_ipc();
 
     fprintf(stderr, "Waiting for victim program...\n");
 
-    /*
-     * These calls block until the victim opens its sides.
-     */
-    int go_fd = open(GO_FIFO, O_WRONLY);
-
-    if (go_fd < 0) {
-        perror("open go FIFO");
-        return EXIT_FAILURE;
-    }
-
-    int done_fd = open(DONE_FIFO, O_RDONLY);
-
-    if (done_fd < 0) {
-        perror("open done FIFO");
-        return EXIT_FAILURE;
-    }
+    // blocks until the victim maps the shared state
+    sem_wait_checked(&ipc->ready_sem, "sem_wait ready");
 
     fprintf(stderr, "Victim connected. Starting attack.\n");
 
@@ -186,16 +244,11 @@ int main(int argc, char **argv)
     prepare_measurement();
 
     for (uint32_t sample = 0; sample < samples; sample++) {
-        /*
-         * Control round:
-         *
-         * The victim wakes and responds, but does not access
-         * its selected cache line.
-         */
+        // victim wakes and responds, but does not access
+        // its selected cache line.
         measure_round(
             attacker_sets,
-            go_fd,
-            done_fd,
+            ipc,
             0,
             measurements
         );
@@ -205,15 +258,10 @@ int main(int argc, char **argv)
                 measurements[monitored_sets[i]];
         }
 
-        /*
-         * Attack round:
-         *
-         * The victim accesses its selected cache line.
-         */
+        // victim accesses its selected cache line.
         measure_round(
             attacker_sets,
-            go_fd,
-            done_fd,
+            ipc,
             1,
             measurements
         );
@@ -224,11 +272,8 @@ int main(int argc, char **argv)
         }
     }
 
-    /*
-     * Closing this pipe tells the victim to exit.
-     */
-    close(go_fd);
-    close(done_fd);
+    request_victim_stop(ipc);
+    sem_wait(&ipc->done_sem);
 
     printf("\nResults over %u samples:\n\n", samples);
 
@@ -263,8 +308,7 @@ int main(int argc, char **argv)
     release_cache_set_ds(ctx, attacker_sets);
     release_cache_ctx(ctx);
 
-    unlink(GO_FIFO);
-    unlink(DONE_FIFO);
+    destroy_ipc(ipc);
 
     return EXIT_SUCCESS;
 }

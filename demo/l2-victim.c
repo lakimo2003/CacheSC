@@ -1,16 +1,32 @@
+#ifndef _GNU_SOURCE
+    #define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <cachesc.h>
 
 #define VICTIM_CPU 8
 
-#define GO_FIFO   "/tmp/cachesc_go_fifo"
-#define DONE_FIFO "/tmp/cachesc_done_fifo"
+#define IPC_SHM_NAME "/cachesc_l2_ipc"
+
+typedef struct {
+    pthread_mutex_t mutex;
+    sem_t ready_sem;
+    sem_t go_sem;
+    sem_t done_sem;
+    char command;
+    int stop;
+    int initialized;
+} ipc_state;
 
 static int valid_set(uint32_t set)
 {
@@ -19,42 +35,62 @@ static int valid_set(uint32_t set)
            set == 99;
 }
 
-static void send_byte(int fd, char value)
+static ipc_state *connect_ipc(void)
 {
-    ssize_t result;
+    ipc_state *ipc;
+    int fd = shm_open(IPC_SHM_NAME, O_RDWR, 0);
 
-    do {
-        result = write(fd, &value, 1);
-    } while (result < 0 && errno == EINTR);
-
-    if (result != 1) {
-        perror("write");
+    if (fd < 0) {
+        perror("shm_open");
+        fprintf(stderr, "Start the attacker first.\n");
         exit(EXIT_FAILURE);
+    }
+
+    ipc = mmap(NULL, sizeof(*ipc), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (ipc == MAP_FAILED) {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+
+    while (!ipc->initialized) {
+        usleep(1000);
+    }
+
+    sem_post(&ipc->ready_sem);
+
+    return ipc;
+}
+
+static void disconnect_ipc(ipc_state *ipc)
+{
+    if (ipc) {
+        munmap(ipc, sizeof(*ipc));
     }
 }
 
-/*
- * Return 0 when the attacker closes the FIFO.
- * Return 1 when one command was received.
- */
-static int receive_byte(int fd, char *value)
+// returns 0 when the attacker sends the stop command
+// returns 1 when one command was received
+static int receive_command(ipc_state *ipc, char *command)
 {
-    ssize_t result;
+    sem_wait(&ipc->go_sem);
 
-    do {
-        result = read(fd, value, 1);
-    } while (result < 0 && errno == EINTR);
-
-    if (result == 0) {
+    pthread_mutex_lock(&ipc->mutex);
+    if (ipc->stop) {
+        pthread_mutex_unlock(&ipc->mutex);
         return 0;
     }
 
-    if (result != 1) {
-        perror("read");
-        exit(EXIT_FAILURE);
-    }
+    *command = ipc->command;
+    pthread_mutex_unlock(&ipc->mutex);
 
     return 1;
+}
+
+static void send_done(ipc_state *ipc)
+{
+    sem_post(&ipc->done_sem);
 }
 
 int main(int argc, char **argv)
@@ -81,10 +117,12 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /*
-     * CPU8 shares its L2 with attacker CPU7.
-     */
-    pin_to_cpu(VICTIM_CPU);
+    if (prctl(PR_SET_L2_ISOLATION, 1, 0, 0, 0) == -1) {
+        perror("prctl");
+        return 1;
+    }
+
+    // pin_to_cpu(VICTIM_CPU);
 
     fprintf(
         stderr,
@@ -101,53 +139,33 @@ int main(int argc, char **argv)
 
     cache_ctx *ctx = get_cache_ctx(L2);
 
-    /*
-     * Allocate one independent line mapping to the selected set.
-     */
     cacheline *victim_line =
         prepare_victim(ctx, selected_set);
 
-    /*
-     * Connect to the attacker.
-     *
-     * Start the attacker before starting this program.
-     */
-    int go_fd = open(GO_FIFO, O_RDONLY);
-
-    if (go_fd < 0) {
-        perror("open go FIFO");
-        fprintf(stderr, "Start the attacker first.\n");
-        return EXIT_FAILURE;
-    }
-
-    int done_fd = open(DONE_FIFO, O_WRONLY);
-
-    if (done_fd < 0) {
-        perror("open done FIFO");
-        return EXIT_FAILURE;
-    }
+    ipc_state *ipc = connect_ipc();
 
     char command;
 
-    while (receive_byte(go_fd, &command)) {
+    while (receive_command(ipc, &command)) {
         if (command == 1) {
-            /*
-             * Perform exactly one access to the selected set.
-             */
             victim(victim_line);
         }
 
-        /*
-         * Inform the attacker that this round is finished.
-         */
-        send_byte(done_fd, 1);
+        send_done(ipc);
     }
 
-    close(go_fd);
-    close(done_fd);
+    send_done(ipc);
+    disconnect_ipc(ipc);
 
     release_victim(ctx, victim_line);
     release_cache_ctx(ctx);
+
+    printf("Disabling L2 isolation...\n");
+
+    if (prctl(PR_SET_L2_ISOLATION, 0, 0, 0, 0) == -1) {
+        perror("prctl");
+        return 1;
+    }
 
     fprintf(stderr, "Victim finished.\n");
 
