@@ -40,7 +40,9 @@ LDFLAGS += -L$(ARGON_LIB) -static
 LDLIBS  += -largon2 -pthread
 
 CC	:= gcc
+CXXFLAGS += -std=c++11 -O2 -Wall -Wextra
 OUT := single-eviction openssl-aes-cbc argon2d-attacker argon2d-victim
+L2_OUT := l2-attacker l2-victim
 
 ifneq ($(NORMALIZE),)
     CFLAGS += -DNORMALIZE=$(NORMALIZE)
@@ -48,12 +50,16 @@ endif
 
 ######## Targets ########
 
-all: $(OUT)
+all: $(OUT) $(L2_OUT)
 
 rebuild: clean all
 
 clean:
-	rm -rf *.o $(OUT)
+	rm -rf *.o $(OUT) $(L2_OUT)
 
 $(OUT):
 	$(CC) $(CFLAGS) -o $@ $(@:=.c) $(LDFLAGS) $(LDLIBS)
+
+# The L2 demos use the local C++ implementation, without the legacy libraries.
+$(L2_OUT): %: %.c cache_conf.c cache_conf.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -x c++ -o $@ $< cache_conf.c -pthread -lrt

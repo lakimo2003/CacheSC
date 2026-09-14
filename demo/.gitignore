@@ -3,3 +3,5 @@ openssl-aes-cbc
 single-eviction
 argon2d-attacker
 argon2d-victim
+l2-attacker
+l2-victim
