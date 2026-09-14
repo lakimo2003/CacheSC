@@ -13,8 +13,12 @@
 #include <unistd.h>
 
 #include <cachesc.h>
+#include <sys/prctl.h>
 
-#define VICTIM_CPU 8
+#define PR_SET_L2_ISOLATION 0x4C320001
+
+
+#define VICTIM_CPU 1
 
 #define IPC_SHM_NAME "/cachesc_l2_ipc"
 
