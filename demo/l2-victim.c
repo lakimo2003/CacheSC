@@ -11,9 +11,8 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <exception>
 
-#include "cache_conf.h"
+#include <cachesc.h>
 #include <sys/prctl.h>
 
 #define PR_SET_L2_ISOLATION 0x4C320001
@@ -51,9 +50,7 @@ static ipc_state *connect_ipc(void)
         exit(EXIT_FAILURE);
     }
 
-    ipc = static_cast<ipc_state *>(
-        mmap(NULL, sizeof(*ipc), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-    );
+    ipc = mmap(NULL, sizeof(*ipc), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
 
     if (ipc == MAP_FAILED) {
@@ -129,7 +126,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // pin_process_to_cpu(VICTIM_CPU);
+    // pin_to_cpu(VICTIM_CPU);
 
     fprintf(
         stderr,
@@ -144,16 +141,10 @@ int main(int argc, char **argv)
         selected_set
     );
 
-    CacheLine *victim_line;
-    try {
-        victim_line = prepare_l2_victim(selected_set);
-    } catch (const std::exception &error) {
-        fprintf(stderr, "L2 victim setup failed: %s\n", error.what());
-        if (prctl(PR_SET_L2_ISOLATION, 0, 0, 0, 0) == -1) {
-            perror("disable L2 isolation");
-        }
-        return EXIT_FAILURE;
-    }
+    cache_ctx *ctx = get_cache_ctx(L2);
+
+    cacheline *victim_line =
+        prepare_victim(ctx, selected_set);
 
     ipc_state *ipc = connect_ipc();
 
@@ -161,7 +152,7 @@ int main(int argc, char **argv)
 
     while (receive_command(ipc, &command)) {
         if (command == 1) {
-            touch_victim_line(victim_line);
+            victim(victim_line);
         }
 
         send_done(ipc);
@@ -170,7 +161,8 @@ int main(int argc, char **argv)
     send_done(ipc);
     disconnect_ipc(ipc);
 
-    release_l2_victim(victim_line);
+    release_victim(ctx, victim_line);
+    release_cache_ctx(ctx);
 
     printf("Disabling L2 isolation...\n");
 

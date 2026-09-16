@@ -12,9 +12,8 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <exception>
 
-#include "cache_conf.h"
+#include <cachesc.h>
 
 #define ATTACKER_CPU 0
 
@@ -32,7 +31,7 @@ typedef struct {
     int initialized;
 } ipc_state;
 
-static const uint32_t monitored_sets[NUMBER_OF_SETS] = {
+static uint32_t monitored_sets[NUMBER_OF_SETS] = {
     30,
     60,
     99
@@ -81,9 +80,7 @@ static ipc_state *create_ipc(void)
         exit(EXIT_FAILURE);
     }
 
-    ipc = static_cast<ipc_state *>(
-        mmap(NULL, sizeof(*ipc), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-    );
+    ipc = mmap(NULL, sizeof(*ipc), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
 
     if (ipc == MAP_FAILED) {
@@ -171,23 +168,29 @@ static void request_victim_stop(ipc_state *ipc)
  // command == 1:
  // Victim accesses its selected cache line.
 static void measure_round(
-    CacheLine *attacker_sets,
+    cacheline *attacker_sets,
     ipc_state *ipc,
     char command,
-    uint32_t *measurements)
+    time_type *measurements)
 {
 
     //Fill all ways of sets 30, 60 and 99
-    CacheLine *probe_head = prime_l2_cache(attacker_sets);
+    cacheline *probe_head = prime_rev(attacker_sets);
 
     send_command(ipc, command);
 
-    wait_for_victim(ipc);
+    sem_wait(&ipc->done_sem);
 
     //Probe the same three sets.
-    probe_l2_cache(probe_head);
+    probe(L2, probe_head);
 
-    collect_l2_measurements(
+    memset(
+        measurements,
+        0,
+        L2_SETS * sizeof(*measurements)
+    );
+
+    get_msrmts_for_all_set(
         probe_head,
         measurements
     );
@@ -206,14 +209,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    CacheLine *attacker_sets;
-    try {
-        pin_process_to_cpu(ATTACKER_CPU);
-        attacker_sets = prepare_l2_sets(monitored_sets, NUMBER_OF_SETS);
-    } catch (const std::exception &error) {
-        fprintf(stderr, "L2 attacker setup failed: %s\n", error.what());
-        return EXIT_FAILURE;
-    }
+    pin_to_cpu(ATTACKER_CPU);
 
     fprintf(
         stderr,
@@ -221,6 +217,15 @@ int main(int argc, char **argv)
         getpid(),
         ATTACKER_CPU
     );
+
+    cache_ctx *ctx = get_cache_ctx(L2);
+
+    cacheline *attacker_sets =
+        prepare_cache_set_ds(
+            ctx,
+            monitored_sets,
+            NUMBER_OF_SETS
+        );
 
     ipc_state *ipc = create_ipc();
 
@@ -234,9 +239,9 @@ int main(int argc, char **argv)
     uint64_t baseline_sums[NUMBER_OF_SETS] = {0};
     uint64_t attack_sums[NUMBER_OF_SETS] = {0};
 
-    uint32_t measurements[L2_cache_conf::set_count];
+    time_type measurements[L2_SETS];
 
-    warm_up_l2_measurements();
+    prepare_measurement();
 
     for (uint32_t sample = 0; sample < samples; sample++) {
         // victim wakes and responds, but does not access
@@ -268,7 +273,7 @@ int main(int argc, char **argv)
     }
 
     request_victim_stop(ipc);
-    wait_for_victim(ipc);
+    sem_wait(&ipc->done_sem);
 
     printf("\nResults over %u samples:\n\n", samples);
 
@@ -300,7 +305,8 @@ int main(int argc, char **argv)
         detected_set
     );
 
-    release_l2_cache(attacker_sets);
+    release_cache_set_ds(ctx, attacker_sets);
+    release_cache_ctx(ctx);
 
     destroy_ipc(ipc);
 
