@@ -11,26 +11,19 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sched.h>
 
-#include <cachesc.h>
+#include "l2_evset.h"
+#include "l2_ipc.h"
+#include "l2_util.h"
+#include "l2_victim.h"
 #include <sys/prctl.h>
 
 #define PR_SET_L2_ISOLATION 0x4C320001
 
 
 #define VICTIM_CPU 1
-
-#define IPC_SHM_NAME "/cachesc_l2_ipc"
-
-typedef struct {
-    pthread_mutex_t mutex;
-    sem_t ready_sem;
-    sem_t go_sem;
-    sem_t done_sem;
-    char command;
-    int stop;
-    int initialized;
-} ipc_state;
+#define POOL_MAX_PAGES 4096
 
 static int valid_set(uint32_t set)
 {
@@ -47,7 +40,7 @@ static ipc_state *connect_ipc(void)
     if (fd < 0) {
         perror("shm_open");
         fprintf(stderr, "Start the attacker first.\n");
-        exit(EXIT_FAILURE);
+        return NULL;
     }
 
     ipc = mmap(NULL, sizeof(*ipc), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -55,10 +48,10 @@ static ipc_state *connect_ipc(void)
 
     if (ipc == MAP_FAILED) {
         perror("mmap");
-        exit(EXIT_FAILURE);
+        return NULL;
     }
 
-    while (!ipc->initialized) {
+    while (!atomic_load_explicit(&ipc->initialized, memory_order_acquire)) {
         usleep(1000);
     }
 
@@ -74,11 +67,17 @@ static void disconnect_ipc(ipc_state *ipc)
     }
 }
 
-// returns 0 when the attacker sends the stop command
-// returns 1 when one command was received
+// Returns 0 for stop, 1 for a command, or -1 for a wait failure.
 static int receive_command(ipc_state *ipc, char *command)
 {
-    sem_wait(&ipc->go_sem);
+    int result;
+    do {
+        result = sem_wait(&ipc->go_sem);
+    } while (result == -1 && errno == EINTR);
+    if (result == -1) {
+        perror("sem_wait go");
+        return -1;
+    }
 
     pthread_mutex_lock(&ipc->mutex);
     if (ipc->stop) {
@@ -109,10 +108,13 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    uint32_t selected_set =
-        (uint32_t) strtoul(argv[1], NULL, 10);
+    char *end;
+    errno = 0;
+    unsigned long value = strtoul(argv[1], &end, 10);
+    uint32_t selected_set = (uint32_t)value;
 
-    if (!valid_set(selected_set)) {
+    if (errno || end == argv[1] || *end || value > UINT32_MAX ||
+        !valid_set(selected_set)) {
         fprintf(
             stderr,
             "Set must be 30, 60, or 99\n"
@@ -121,7 +123,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (prctl(PR_SET_L2_ISOLATION, 1, 0, 0, 0) == -1) {
+    if (prctl(PR_SET_L2_ISOLATION, 1UL, 0UL, 0UL, 0UL) == -1) {
         perror("prctl");
         return 1;
     }
@@ -132,7 +134,7 @@ int main(int argc, char **argv)
         stderr,
         "Victim PID %d running on CPU%d\n",
         getpid(),
-        VICTIM_CPU
+        sched_getcpu()
     );
 
     fprintf(
@@ -141,18 +143,26 @@ int main(int argc, char **argv)
         selected_set
     );
 
-    cache_ctx *ctx = get_cache_ctx(L2);
-
-    cacheline *victim_line =
-        prepare_victim(ctx, selected_set);
+    int exit_status = EXIT_FAILURE;
+    l2_evsets victim_set = {0};
+    if (l2_evsets_create(&victim_set, &selected_set, 1, 1, POOL_MAX_PAGES) == -1) {
+        perror("l2_evsets_create");
+        goto disable_isolation;
+    }
+    l2_line *victim_line = victim_set.sets[0].head;
 
     ipc_state *ipc = connect_ipc();
+    if (!ipc) {
+        l2_evsets_destroy(&victim_set);
+        goto disable_isolation;
+    }
 
     char command;
+    int received;
 
-    while (receive_command(ipc, &command)) {
+    while ((received = receive_command(ipc, &command)) > 0) {
         if (command == 1) {
-            victim(victim_line);
+            l2_victim_touch(victim_line);
         }
 
         send_done(ipc);
@@ -161,17 +171,18 @@ int main(int argc, char **argv)
     send_done(ipc);
     disconnect_ipc(ipc);
 
-    release_victim(ctx, victim_line);
-    release_cache_ctx(ctx);
+    l2_evsets_destroy(&victim_set);
+    exit_status = received == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 
+disable_isolation:
     printf("Disabling L2 isolation...\n");
 
-    if (prctl(PR_SET_L2_ISOLATION, 0, 0, 0, 0) == -1) {
+    if (prctl(PR_SET_L2_ISOLATION, 0UL, 0UL, 0UL, 0UL) == -1) {
         perror("prctl");
         return 1;
     }
 
     fprintf(stderr, "Victim finished.\n");
 
-    return EXIT_SUCCESS;
+    return exit_status;
 }

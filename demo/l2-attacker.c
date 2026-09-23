@@ -13,23 +13,15 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include <cachesc.h>
+#include "l2_evset.h"
+#include "l2_ipc.h"
+#include "l2_probe.h"
+#include "l2_util.h"
 
 #define ATTACKER_CPU 0
 
 #define NUMBER_OF_SETS 3
-
-#define IPC_SHM_NAME "/cachesc_l2_ipc"
-
-typedef struct {
-    pthread_mutex_t mutex;
-    sem_t ready_sem;
-    sem_t go_sem;
-    sem_t done_sem;
-    char command;
-    int stop;
-    int initialized;
-} ipc_state;
+#define POOL_MAX_PAGES 4096
 
 static uint32_t monitored_sets[NUMBER_OF_SETS] = {
     30,
@@ -90,6 +82,7 @@ static ipc_state *create_ipc(void)
     }
 
     memset(ipc, 0, sizeof(*ipc));
+    atomic_init(&ipc->initialized, 0);
 
     result = pthread_mutexattr_init(&mutex_attr);
     if (result != 0) {
@@ -120,7 +113,7 @@ static ipc_state *create_ipc(void)
         exit(EXIT_FAILURE);
     }
 
-    ipc->initialized = 1;
+    atomic_store_explicit(&ipc->initialized, 1, memory_order_release);
 
     return ipc;
 }
@@ -168,32 +161,21 @@ static void request_victim_stop(ipc_state *ipc)
  // command == 1:
  // Victim accesses its selected cache line.
 static void measure_round(
-    cacheline *attacker_sets,
+    const l2_evsets *attacker_sets,
     ipc_state *ipc,
     char command,
-    time_type *measurements)
+    l2_time_t *measurements)
 {
-
-    //Fill all ways of sets 30, 60 and 99
-    cacheline *probe_head = prime_rev(attacker_sets);
+    /* The old reverse traversal probed sets in order 99, 60, 30. */
+    for (size_t i = attacker_sets->set_count; i-- > 0;)
+        (void)l2_prime_set(attacker_sets->sets[i].head);
 
     send_command(ipc, command);
 
-    sem_wait(&ipc->done_sem);
+    wait_for_victim(ipc);
 
-    //Probe the same three sets.
-    probe(L2, probe_head);
-
-    memset(
-        measurements,
-        0,
-        L2_SETS * sizeof(*measurements)
-    );
-
-    get_msrmts_for_all_set(
-        probe_head,
-        measurements
-    );
+    for (size_t i = attacker_sets->set_count; i-- > 0;)
+        measurements[i] = l2_probe_set(attacker_sets->sets[i].head).ticks;
 }
 
 int main(int argc, char **argv)
@@ -201,15 +183,24 @@ int main(int argc, char **argv)
     uint32_t samples = 10000;
 
     if (argc == 2) {
-        samples = (uint32_t) strtoul(argv[1], NULL, 10);
+        char *end;
+        errno = 0;
+        unsigned long value = strtoul(argv[1], &end, 10);
+        if (errno || end == argv[1] || *end || value > UINT32_MAX)
+            samples = 0;
+        else
+            samples = (uint32_t)value;
     }
 
-    if (samples == 0) {
+    if (samples == 0 || argc > 2) {
         fprintf(stderr, "Usage: %s [number-of-samples]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    pin_to_cpu(ATTACKER_CPU);
+    if (pin_to_cpu(ATTACKER_CPU) == -1) {
+        perror("pin_to_cpu");
+        return EXIT_FAILURE;
+    }
 
     fprintf(
         stderr,
@@ -218,14 +209,12 @@ int main(int argc, char **argv)
         ATTACKER_CPU
     );
 
-    cache_ctx *ctx = get_cache_ctx(L2);
-
-    cacheline *attacker_sets =
-        prepare_cache_set_ds(
-            ctx,
-            monitored_sets,
-            NUMBER_OF_SETS
-        );
+    l2_evsets attacker_sets = {0};
+    if (l2_evsets_create(&attacker_sets, monitored_sets, NUMBER_OF_SETS,
+                         L2_ASSOCIATIVITY, POOL_MAX_PAGES) == -1) {
+        perror("l2_evsets_create");
+        return EXIT_FAILURE;
+    }
 
     ipc_state *ipc = create_ipc();
 
@@ -239,15 +228,22 @@ int main(int argc, char **argv)
     uint64_t baseline_sums[NUMBER_OF_SETS] = {0};
     uint64_t attack_sums[NUMBER_OF_SETS] = {0};
 
-    time_type measurements[L2_SETS];
+    l2_time_t measurements[NUMBER_OF_SETS];
 
-    prepare_measurement();
+    if (l2_prepare_measurement() == -1) {
+        perror("l2_prepare_measurement");
+        request_victim_stop(ipc);
+        wait_for_victim(ipc);
+        l2_evsets_destroy(&attacker_sets);
+        destroy_ipc(ipc);
+        return EXIT_FAILURE;
+    }
 
     for (uint32_t sample = 0; sample < samples; sample++) {
         // victim wakes and responds, but does not access
         // its selected cache line.
         measure_round(
-            attacker_sets,
+            &attacker_sets,
             ipc,
             0,
             measurements
@@ -255,12 +251,12 @@ int main(int argc, char **argv)
 
         for (uint32_t i = 0; i < NUMBER_OF_SETS; i++) {
             baseline_sums[i] +=
-                measurements[monitored_sets[i]];
+                measurements[i];
         }
 
         // victim accesses its selected cache line.
         measure_round(
-            attacker_sets,
+            &attacker_sets,
             ipc,
             1,
             measurements
@@ -268,12 +264,12 @@ int main(int argc, char **argv)
 
         for (uint32_t i = 0; i < NUMBER_OF_SETS; i++) {
             attack_sums[i] +=
-                measurements[monitored_sets[i]];
+                measurements[i];
         }
     }
 
     request_victim_stop(ipc);
-    sem_wait(&ipc->done_sem);
+    wait_for_victim(ipc);
 
     printf("\nResults over %u samples:\n\n", samples);
 
@@ -305,8 +301,7 @@ int main(int argc, char **argv)
         detected_set
     );
 
-    release_cache_set_ds(ctx, attacker_sets);
-    release_cache_ctx(ctx);
+    l2_evsets_destroy(&attacker_sets);
 
     destroy_ipc(ipc);
 
