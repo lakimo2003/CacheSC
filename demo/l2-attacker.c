@@ -15,7 +15,7 @@
 
 #include <cachesc.h>
 
-#define ATTACKER_CPU 7
+#define ATTACKER_CPU 12
 
 #define NUMBER_OF_SETS 3
 

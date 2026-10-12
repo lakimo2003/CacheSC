@@ -14,7 +14,7 @@
 
 #include <cachesc.h>
 
-#define VICTIM_CPU 8
+#define VICTIM_CPU 0
 
 #define IPC_SHM_NAME "/cachesc_l2_ipc"
 
@@ -117,12 +117,12 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (prctl(PR_SET_L2_ISOLATION, 1, 0, 0, 0) == -1) {
-        perror("prctl");
-        return 1;
-    }
+//    if (prctl(PR_SET_L2_ISOLATION, 1, 0, 0, 0) == -1) {
+//        perror("prctl");
+//        return 1;
+//    }
 
-    // pin_to_cpu(VICTIM_CPU);
+    pin_to_cpu(VICTIM_CPU);
 
     fprintf(
         stderr,
@@ -162,10 +162,10 @@ int main(int argc, char **argv)
 
     printf("Disabling L2 isolation...\n");
 
-    if (prctl(PR_SET_L2_ISOLATION, 0, 0, 0, 0) == -1) {
-        perror("prctl");
-        return 1;
-    }
+   // if (prctl(PR_SET_L2_ISOLATION, 0, 0, 0, 0) == -1) {
+     //   perror("prctl");
+       // return 1;
+   // }
 
     fprintf(stderr, "Victim finished.\n");
 

@@ -46,7 +46,7 @@
 #define L1_ACCESS_TIME 4
 
 #define L2_ADDRESSING 1
-#define L2_SETS 512
+#define L2_SETS 1024
 #define L2_ASSOCIATIVITY 8
 #define L2_ACCESS_TIME 12
 
