@@ -18,7 +18,7 @@
 #include "l2_probe.h"
 #include "l2_util.h"
 
-#define ATTACKER_CPU 0
+#define ATTACKER_CPU 12
 
 #define NUMBER_OF_SETS 3
 #define POOL_MAX_PAGES 4096

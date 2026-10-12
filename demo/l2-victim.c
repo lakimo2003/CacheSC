@@ -22,7 +22,7 @@
 #define PR_SET_L2_ISOLATION 0x4C320001
 
 
-#define VICTIM_CPU 1
+#define VICTIM_CPU 0
 #define POOL_MAX_PAGES 4096
 
 static int valid_set(uint32_t set)
@@ -123,12 +123,12 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (prctl(PR_SET_L2_ISOLATION, 1UL, 0UL, 0UL, 0UL) == -1) {
-        perror("prctl");
-        return 1;
-    }
+   // if (prctl(PR_SET_L2_ISOLATION, 1UL, 0UL, 0UL, 0UL) == -1) {
+     //   perror("prctl");
+       // return 1;
+   // }
 
-    // pin_to_cpu(VICTIM_CPU);
+    pin_to_cpu(VICTIM_CPU);
 
     fprintf(
         stderr,
@@ -147,14 +147,14 @@ int main(int argc, char **argv)
     l2_evsets victim_set = {0};
     if (l2_evsets_create(&victim_set, &selected_set, 1, 1, POOL_MAX_PAGES) == -1) {
         perror("l2_evsets_create");
-        goto disable_isolation;
+       // goto disable_isolation;
     }
     l2_line *victim_line = victim_set.sets[0].head;
 
     ipc_state *ipc = connect_ipc();
     if (!ipc) {
         l2_evsets_destroy(&victim_set);
-        goto disable_isolation;
+     //   goto disable_isolation;
     }
 
     char command;
@@ -174,13 +174,13 @@ int main(int argc, char **argv)
     l2_evsets_destroy(&victim_set);
     exit_status = received == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 
-disable_isolation:
-    printf("Disabling L2 isolation...\n");
+//disable_isolation:
+  //  printf("Disabling L2 isolation...\n");
 
-    if (prctl(PR_SET_L2_ISOLATION, 0UL, 0UL, 0UL, 0UL) == -1) {
-        perror("prctl");
-        return 1;
-    }
+   // if (prctl(PR_SET_L2_ISOLATION, 0UL, 0UL, 0UL, 0UL) == -1) {
+     //   perror("prctl");
+       // return 1;
+   // }
 
     fprintf(stderr, "Victim finished.\n");
 
