@@ -12,7 +12,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sched.h>
-
+#include <string.h>
 #include "l2_evset.h"
 #include "l2_ipc.h"
 #include "l2_util.h"
