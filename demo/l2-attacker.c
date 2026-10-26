@@ -1,5 +1,5 @@
 #ifndef _GNU_SOURCE
-    #define _GNU_SOURCE
+#define _GNU_SOURCE
 #endif
 
 #include <stdio.h>
@@ -18,7 +18,7 @@
 #include "l2_probe.h"
 #include "l2_util.h"
 
-#define ATTACKER_CPU 12
+#define ATTACKER_CPU 23
 
 #define NUMBER_OF_SETS 3
 #define POOL_MAX_PAGES 4096
@@ -201,7 +201,7 @@ int main(int argc, char **argv)
         perror("pin_to_cpu");
         return EXIT_FAILURE;
     }
-
+    printf("i am running on 23!\n");
     fprintf(
         stderr,
         "Attacker PID %d running on CPU%d\n",

@@ -1,5 +1,5 @@
 #ifndef _GNU_SOURCE
-    #define _GNU_SOURCE
+#define _GNU_SOURCE
 #endif
 
 #include <stdio.h>
@@ -19,10 +19,19 @@
 #include "l2_victim.h"
 #include <sys/prctl.h>
 
-#define PR_SET_L2_ISOLATION 0x4C320001
+#ifndef PR_SCHED_CORE_RESERVE
+#define PR_SCHED_CORE_RESERVE 0x43525356
+#endif
 
+#ifndef PR_SCHED_CORE_RESERVE_ENABLE
+#define PR_SCHED_CORE_RESERVE_ENABLE 1
+#endif
 
-#define VICTIM_CPU 0
+#ifndef PR_SCHED_CORE_RESERVE_DISABLE
+#define PR_SCHED_CORE_RESERVE_DISABLE 2
+#endif
+
+#define VICTIM_CPU 11
 #define POOL_MAX_PAGES 4096
 
 static int valid_set(uint32_t set)
@@ -123,12 +132,12 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-   // if (prctl(PR_SET_L2_ISOLATION, 1UL, 0UL, 0UL, 0UL) == -1) {
-     //   perror("prctl");
-       // return 1;
-   // }
-
-    pin_to_cpu(VICTIM_CPU);
+     if (prctl(PR_SCHED_CORE_RESERVE,
+              (unsigned long)PR_SCHED_CORE_RESERVE_ENABLE,
+              11UL, 0UL, 0UL) == -1) {
+        perror("core reserve");
+        return EXIT_FAILURE;
+    }
 
     fprintf(
         stderr,
