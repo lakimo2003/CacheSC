@@ -12,6 +12,8 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sched.h>
+#include <stdbool.h>
 
 #include "l2_evset.h"
 #include "l2_ipc.h"
@@ -178,35 +180,60 @@ static void measure_round(
         measurements[i] = l2_probe_set(attacker_sets->sets[i].head).ticks;
 }
 
+static int allow_attacker_migration(void)
+{
+    cpu_set_t allowed;
+
+    CPU_ZERO(&allowed);
+    CPU_SET(0, &allowed);
+    CPU_SET(ATTACKER_CPU, &allowed);
+
+    return sched_setaffinity(0, sizeof(allowed), &allowed);
+}
+
 int main(int argc, char **argv)
 {
     uint32_t samples = 10000;
+    bool movable = false;
 
-    if (argc == 2) {
+    if (argc > 3) {
+        fprintf(stderr, "Usage: %s [samples] [fixed|movable]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    if (argc >= 2) {
         char *end;
         errno = 0;
         unsigned long value = strtoul(argv[1], &end, 10);
-        if (errno || end == argv[1] || *end || value > UINT32_MAX)
-            samples = 0;
-        else
-            samples = (uint32_t)value;
+
+        if (errno || end == argv[1] || *end ||
+            value == 0 || value > UINT32_MAX) {
+            fprintf(stderr, "Invalid sample count\n");
+            return EXIT_FAILURE;
+        }
+
+        samples = (uint32_t)value;
     }
 
-    if (samples == 0 || argc > 2) {
-        fprintf(stderr, "Usage: %s [number-of-samples]\n", argv[0]);
-        return EXIT_FAILURE;
+    if (argc == 3) {
+        if (strcmp(argv[2], "movable") == 0) {
+            movable = true;
+        } else if (strcmp(argv[2], "fixed") != 0) {
+            fprintf(stderr, "Choose fixed or movable\n");
+            return EXIT_FAILURE;
+        }
     }
 
     if (pin_to_cpu(ATTACKER_CPU) == -1) {
         perror("pin_to_cpu");
         return EXIT_FAILURE;
     }
-    printf("i am running on 23!\n");
+
     fprintf(
         stderr,
         "Attacker PID %d running on CPU%d\n",
         getpid(),
-        ATTACKER_CPU
+        sched_getcpu()
     );
 
     l2_evsets attacker_sets = {0};
@@ -218,10 +245,31 @@ int main(int argc, char **argv)
 
     ipc_state *ipc = create_ipc();
 
+    if (movable && allow_attacker_migration() == -1) {
+    perror("allow_attacker_migration");
+    destroy_ipc(ipc);
+    l2_evsets_destroy(&attacker_sets);
+    return EXIT_FAILURE;
+    }
+
     fprintf(stderr, "Waiting for victim program...\n");
 
     // blocks until the victim maps the shared state
     sem_wait_checked(&ipc->ready_sem, "sem_wait ready");
+
+    pthread_mutex_lock(&ipc->mutex);
+    int victim_failed = ipc->stop;
+    pthread_mutex_unlock(&ipc->mutex);
+
+    if (victim_failed) {
+        fprintf(stderr, "Victim setup or reservation failed.\n");
+        destroy_ipc(ipc);
+        l2_evsets_destroy(&attacker_sets);
+        return EXIT_FAILURE;
+    }
+
+    fprintf(stderr, "Attacker CPU after victim setup: %d\n",
+            sched_getcpu());
 
     fprintf(stderr, "Victim connected. Starting attack.\n");
 
