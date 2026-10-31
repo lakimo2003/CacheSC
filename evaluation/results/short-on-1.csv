@@ -1,0 +1,2 @@
+mode,seconds,workers,victim_jobs,worker_jobs,total_jobs,victim_jobs_per_s,worker_jobs_per_s,total_jobs_per_s,enable_us,disable_us
+on,10,23,61209,1194299,1255508,6120.900,119429.900,125550.800,7176.173,7018.729
